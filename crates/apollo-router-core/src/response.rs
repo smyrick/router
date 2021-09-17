@@ -65,7 +65,7 @@ impl GraphQLResponse {
                 .into_iter()
                 .flat_map(|value| match (value, selections) {
                     (Value::Object(content), requires) => {
-                        select_object(content, requires).transpose()
+                        Some(select_object(content, requires).transpose().expect("todo"))
                     }
                     (_, _) => Some(Err(FetchError::ExecutionInvalidContent {
                         reason: "not an object".to_string(),
@@ -88,6 +88,17 @@ impl GraphQLResponse {
         }
 
         Ok(())
+    }
+
+    /// TODO
+    pub fn merge(&mut self, mut other: Self) {
+        if let Some(path) = other.path.as_ref() {
+            self.insert_data(path, other.data).expect("todo");
+        } else {
+            self.data.deep_merge(&other.data);
+        }
+
+        self.errors.append(&mut other.errors);
     }
 }
 

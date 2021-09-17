@@ -119,22 +119,10 @@ impl GraphQLFetcher for FederatedGraph {
 
         stream::once(
             async move {
-                let response = Arc::new(Mutex::new(GraphQLResponse::builder().build()));
+                let response = GraphQLResponse::builder().build();
                 let root = Path::empty();
 
-                execute(
-                    response.clone(),
-                    &root,
-                    &plan,
-                    request,
-                    service_registry.clone(),
-                )
-                .await;
-
-                // TODO: this is not great but there is no other way
-                Arc::try_unwrap(response)
-                    .expect("todo: how to prove?")
-                    .into_inner()
+                execute(&response, &root, &plan, request, service_registry.clone()).await
             }
             .in_current_span()
             .with_current_subscriber(),
@@ -144,12 +132,12 @@ impl GraphQLFetcher for FederatedGraph {
 }
 
 fn execute<'a>(
-    response: Arc<Mutex<GraphQLResponse>>,
+    response: &'a GraphQLResponse,
     current_dir: &'a Path,
     plan: &'a PlanNode,
     request: Arc<GraphQLRequest>,
     service_registry: Arc<dyn ServiceRegistry>,
-) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = GraphQLResponse> + Send + 'a>> {
     let span = tracing::info_span!("execution");
     let _guard = span.enter();
 
@@ -158,21 +146,25 @@ fn execute<'a>(
 
         match plan {
             PlanNode::Sequence { nodes } => {
+                let mut result = response.clone();
                 for node in nodes {
-                    execute(
-                        response.clone(),
-                        current_dir,
-                        node,
-                        request.clone(),
-                        service_registry.clone(),
-                    )
-                    .await;
+                    result.merge(
+                        execute(
+                            &result,
+                            current_dir,
+                            node,
+                            request.clone(),
+                            service_registry.clone(),
+                        )
+                        .await,
+                    );
                 }
+                result
             }
             PlanNode::Parallel { nodes } => {
-                future::join_all(nodes.iter().map(|plan| {
+                let sub_results = future::join_all(nodes.iter().map(|plan| {
                     execute(
-                        response.clone(),
+                        response,
                         current_dir,
                         plan,
                         request.clone(),
@@ -180,31 +172,42 @@ fn execute<'a>(
                     )
                 }))
                 .await;
+                // TODO implementing FromIter would help
+                let mut result = response.clone();
+                for sub_response in sub_results {
+                    result.merge(sub_response);
+                }
+                result
             }
             PlanNode::Fetch(info) => {
-                match fetch_node(
-                    response.clone(),
+                let result = fetch_node(
+                    response,
                     current_dir,
                     info,
                     request.clone(),
                     service_registry.clone(),
                 )
-                .await
-                {
-                    Ok(()) => {
+                .await;
+
+                debug_assert!(result.is_ok(), "Fetch error: {:?}", result);
+
+                match result {
+                    Ok(sub_response) => {
                         log::trace!(
                             "New data:\n{}",
-                            serde_json::to_string_pretty(&response.lock().await.data).unwrap(),
+                            serde_json::to_string_pretty(&response.data).unwrap(),
                         );
+                        let mut result = response.clone();
+                        result.merge(sub_response);
+                        result
                     }
                     Err(err) => {
-                        debug_assert!(false, "{}", err);
                         log::error!("Fetch error: {}", err);
-                        response
-                            .lock()
-                            .await
+                        let mut result = response.clone();
+                        result
                             .errors
                             .push(err.to_graphql_error(Some(current_dir.to_owned())));
+                        result
                     }
                 }
             }
@@ -212,21 +215,21 @@ fn execute<'a>(
                 // this is the only command that actually changes the "current dir"
                 let current_dir = current_dir.join(path);
                 execute(
-                    response.clone(),
+                    response,
                     // a path can go over multiple json node!
                     &current_dir,
                     node,
                     request.clone(),
                     service_registry.clone(),
                 )
-                .await;
+                .await
             }
         }
     })
 }
 
 async fn fetch_node<'a>(
-    response: Arc<Mutex<GraphQLResponse>>,
+    response: &'a GraphQLResponse,
     current_dir: &'a Path,
     FetchNode {
         variable_usages,
@@ -236,7 +239,7 @@ async fn fetch_node<'a>(
     }: &'a FetchNode,
     request: Arc<GraphQLRequest>,
     service_registry: Arc<dyn ServiceRegistry>,
-) -> Result<(), FetchError> {
+) -> Result<GraphQLResponse, FetchError> {
     if let Some(requires) = requires {
         // We already checked that the service exists during planning
         let fetcher = service_registry.get(service_name).unwrap();
@@ -250,7 +253,6 @@ async fn fetch_node<'a>(
         }));
 
         {
-            let response = response.lock().await;
             log::trace!(
                 "Creating representations at path '{}' for selections={:?} using data={}",
                 current_dir,
@@ -258,6 +260,7 @@ async fn fetch_node<'a>(
                 serde_json::to_string(&response.data).unwrap(),
             );
             let representations = response.select(current_dir, requires)?;
+            debug_assert!(!representations.as_array().unwrap().is_empty());
             variables.insert("representations".into(), representations);
         }
 
@@ -284,16 +287,16 @@ async fn fetch_node<'a>(
                         serde_json::to_string(entities).unwrap(),
                     );
                     if let Some(array) = entities.as_array() {
-                        let mut response = response.lock().await;
+                        let mut result = response.clone();
 
                         for (i, entity) in array.iter().enumerate() {
-                            response.insert_data(
+                            result.insert_data(
                                 &current_dir.join(Path::from(i.to_string())),
                                 entity.to_owned(),
                             )?;
                         }
 
-                        Ok(())
+                        Ok(result)
                     } else {
                         Err(FetchError::ExecutionInvalidContent {
                             reason: "Received invalid type for key `_entities`!".to_string(),
@@ -342,8 +345,9 @@ async fn fetch_node<'a>(
                 })
             }
             Some(GraphQLResponse { data, .. }) => {
-                response.lock().await.insert_data(current_dir, data)?;
-                Ok(())
+                let mut result = response.clone();
+                result.insert_data(current_dir, data)?;
+                Ok(result)
             }
             None => Err(FetchError::SubrequestNoResponse {
                 service: service_name.to_string(),
