@@ -84,7 +84,7 @@ impl GraphQLResponse {
                 })?;
 
         for node in nodes {
-            node.deep_merge(&value);
+            node.deep_merge(value.clone());
         }
 
         Ok(())
@@ -95,7 +95,7 @@ impl GraphQLResponse {
         if let Some(path) = other.path.as_ref() {
             self.insert_data(path, other.data).expect("todo");
         } else {
-            self.data.deep_merge(&other.data);
+            self.data.deep_merge(other.data);
         }
 
         self.errors.append(&mut other.errors);
@@ -108,10 +108,11 @@ fn select_object(content: &Object, selections: &[Selection]) -> Result<Option<Va
         match selection {
             Selection::Field(field) => {
                 if let Some(value) = select_field(content, field)? {
-                    output
-                        .entry(field.name.to_owned())
-                        .and_modify(|existing| existing.deep_merge(&value))
-                        .or_insert(value);
+                    if let Some(existing) = output.get_mut(&field.name) {
+                        existing.deep_merge(value);
+                    } else {
+                        output.insert(field.name.to_owned(), value);
+                    }
                 }
             }
             Selection::InlineFragment(fragment) => {

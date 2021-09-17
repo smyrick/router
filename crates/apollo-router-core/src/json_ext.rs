@@ -33,7 +33,7 @@ pub trait ValueExt {
     /// Deep merge the JSON objects, array and override the values in `&mut self` if they already
     /// exists.
     #[track_caller]
-    fn deep_merge(&mut self, other: &Self);
+    fn deep_merge(&mut self, other: Self);
 
     /// Returns `true` if the set is a subset of another, i.e., `other` contains at least all the
     /// values in `self`.
@@ -127,13 +127,13 @@ impl ValueExt for Value {
         Ok(current)
     }
 
-    fn deep_merge(&mut self, other: &Self) {
+    fn deep_merge(&mut self, other: Self) {
         match (self, other) {
             (Value::Object(a), Value::Object(b)) => {
-                for (key, value) in b.iter() {
+                for (key, value) in b.into_iter() {
                     match a.entry(key) {
                         Entry::Vacant(e) => {
-                            e.insert(value.to_owned());
+                            e.insert(value);
                         }
                         Entry::Occupied(e) => {
                             e.into_mut().deep_merge(value);
@@ -142,14 +142,12 @@ impl ValueExt for Value {
                 }
             }
             (Value::Array(a), Value::Array(b)) => {
-                for (index, value) in a.iter_mut().enumerate() {
-                    if let Some(b) = b.get(index) {
-                        value.deep_merge(b);
-                    }
+                for (a, b) in a.iter_mut().zip(b.into_iter()) {
+                    a.deep_merge(b);
                 }
             }
             (a, b) => {
-                *a = b.to_owned();
+                *a = b;
             }
         }
     }
@@ -421,7 +419,7 @@ mod tests {
     #[test]
     fn test_deep_merge() {
         let mut json = json!({"obj":{"arr":[{"prop1":1},{"prop2":2}]}});
-        json.deep_merge(&json!({"obj":{"arr":[{"prop1":2,"prop3":3},{"prop4":4}]}}));
+        json.deep_merge(json!({"obj":{"arr":[{"prop1":2,"prop3":3},{"prop4":4}]}}));
         assert_eq!(
             json,
             json!({"obj":{"arr":[{"prop1":2, "prop3":3},{"prop2":2, "prop4":4}]}})
