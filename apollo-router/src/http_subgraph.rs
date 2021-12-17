@@ -2,8 +2,9 @@ use apollo_router_core::prelude::*;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use derivative::Derivative;
-use futures::prelude::*;
-use std::pin::Pin;
+use futures::{lock::Mutex, prelude::*};
+use std::{collections::HashMap, pin::Pin};
+use tokio::sync::broadcast::{self, Sender};
 use tracing::Instrument;
 
 type BytesStream = Pin<
@@ -19,6 +20,8 @@ pub struct HttpSubgraphFetcher {
     url: String,
     #[derivative(Debug = "ignore")]
     http_client: reqwest_middleware::ClientWithMiddleware,
+    #[derivative(Debug = "ignore")]
+    wait_map: Mutex<HashMap<String, Sender<graphql::Response>>>,
 }
 
 impl HttpSubgraphFetcher {
@@ -36,6 +39,7 @@ impl HttpSubgraphFetcher {
             .build(),
             service,
             url,
+            wait_map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -103,15 +107,55 @@ impl HttpSubgraphFetcher {
             .into_stream(),
         )
     }
+
+    async fn dedup(&self, request: graphql::Request) -> graphql::ResponseStream {
+        let hashed_request = serde_json::to_string(&request).unwrap();
+
+        let mut locked_wait_map = self.wait_map.lock().await;
+        let res = match locked_wait_map.get_mut(&hashed_request) {
+            Some(waiter) => {
+                // Register interest in key
+                let mut receiver = waiter.subscribe();
+                drop(locked_wait_map);
+                let recv_value = receiver.recv().await.expect("FIXME");
+                recv_value
+            }
+            None => {
+                let (tx, _rx) = broadcast::channel(1);
+                locked_wait_map.insert(hashed_request.clone(), tx.clone());
+                drop(locked_wait_map);
+
+                let service_name = self.service.to_string();
+                let bytes_stream = self.request_stream(request);
+                let res = Self::map_to_graphql(service_name, bytes_stream)
+                    .next()
+                    .await
+                    .unwrap();
+
+                let mut locked_wait_map = self.wait_map.lock().await;
+                locked_wait_map.remove(&hashed_request);
+                // Let our waiters know
+                let broadcast_value = res.clone();
+                // Our use case is very specific, so we are sure that
+                // we won't get any errors here.
+                tokio::task::spawn_blocking(move || {
+                    tx.send(broadcast_value)
+                        .expect("there is always at least one receiver alive, the _rx guard; qed")
+                }).await
+                .expect("can only fail if the task is aborted or if the internal code panics, neither is possible here; qed");
+                res
+            }
+        };
+
+        Box::pin(async { res }.into_stream())
+    }
 }
 
 #[async_trait]
 impl graphql::Fetcher for HttpSubgraphFetcher {
     /// Using reqwest fetch a stream of graphql results.
     async fn stream(&self, request: graphql::Request) -> graphql::ResponseStream {
-        let service_name = self.service.to_string();
-        let bytes_stream = self.request_stream(request);
-        Self::map_to_graphql(service_name, bytes_stream)
+        self.dedup(request).await
     }
 }
 
